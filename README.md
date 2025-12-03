@@ -1,3 +1,6 @@
+> [!WARNING]
+> PiVPN is maintained on a best-effort basis, please read more about it [here](https://github.com/pivpn/pivpn/releases/tag/v4.6.1). Previous announcement is [here](https://github.com/pivpn/pivpn/releases/tag/v4.6.0).
+
 ![Pivpn Banner](pivpnbanner.png)
 
 ![Logos](logos.jpg)

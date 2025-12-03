@@ -21,7 +21,7 @@ pivpnFilesDir="/usr/local/src/pivpn"
 pivpnScriptDir="/opt/pivpn"
 GITBIN="/usr/bin/git"
 
-piholeSetupVars="/etc/pihole/setupVars.conf"
+piholeVersions="/etc/pihole/versions"
 dnsmasqConfig="/etc/dnsmasq.d/02-pivpn.conf"
 
 dhcpcdFile="/etc/dhcpcd.conf"
@@ -38,7 +38,7 @@ CHECK_PKG_INSTALLED='dpkg-query -s'
 
 # Dependencies that are required by the script,
 # regardless of the VPN protocol chosen
-BASE_DEPS=(git tar curl grep dnsutils grepcidr whiptail net-tools)
+BASE_DEPS=(git tar curl grep bind9-dnsutils grepcidr whiptail net-tools)
 BASE_DEPS+=(bsdmainutils bash-completion)
 
 BASE_DEPS_ALPINE=(git grep bind-tools newt net-tools bash-completion coreutils)
@@ -46,17 +46,18 @@ BASE_DEPS_ALPINE+=(openssl util-linux openrc iptables ip6tables coreutils sed)
 BASE_DEPS_ALPINE+=(perl libqrencode-tools)
 
 # Dependencies that where actually installed by the script. For example if the
-# script requires grep and dnsutils but dnsutils is already installed, we save
+# script requires grep and bind9-dnsutils but bind9-dnsutils is already installed, we save
 # grep here. This way when uninstalling PiVPN we won't prompt to remove packages
 # that may have been installed by the user for other reasons
 INSTALLED_PACKAGES=()
 
 ######## URLs ########
-easyrsaVer="3.1.0"
+easyrsaVer="3.2.3"
 easyrsaRel="https://github.com/OpenVPN/easy-rsa/releases/download/v${easyrsaVer}/EasyRSA-${easyrsaVer}.tgz"
 
 ######## Undocumented Flags. Shhh ########
 runUnattended=false
+usePiholeDNS=false
 skipSpaceCheck=false
 reconfigure=false
 showUnsupportedNICs=false
@@ -226,6 +227,9 @@ flagsCheck() {
         runUnattended=true
         unattendedConfig="${!j}"
         ;;
+      "--use-pihole")
+        usePiholeDNS=true
+        ;;
       "--reconfigure")
         reconfigure=true
         ;;
@@ -277,6 +281,9 @@ checkExistingInstall() {
   elif [[ -r "${setupConfigDir}/openvpn/${setupVarsFile}" ]]; then
     setupVars="${setupConfigDir}/openvpn/${setupVarsFile}"
   fi
+
+  # Remove existing temporary setup vars file in case it's owned by another user
+  ${SUDO} rm -f "${tempsetupVarsFile}"
 
   if [[ -r "${setupVars}" ]]; then
     if [[ "${reconfigure}" == 'true' ]]; then
@@ -347,13 +354,14 @@ distroCheck() {
     . /etc/os-release
     PLAT="$(awk '{print $1}' <<< "${NAME}")"
     VER="${VERSION_ID}"
-    declare -A VER_MAP=(["10"]="buster"
+    declare -A VER_MAP=(
       ["11"]="bullseye"
       ["12"]="bookworm"
-      ["18.04"]="bionic"
+      ["13"]="trixie"
       ["20.04"]="focal"
       ["22.04"]="jammy"
-      ["23.04"]="lunar")
+      ["24.04"]="noble"
+    )
     OSCN="${VER_MAP["${VER}"]}"
 
     # Alpine support
@@ -365,7 +373,7 @@ distroCheck() {
   case "${PLAT}" in
     Debian | Raspbian | Ubuntu)
       case "${OSCN}" in
-        stretch | buster | bullseye | bookworm | xenial | bionic | focal | jammy | lunar)
+        bullseye | bookworm | trixie | focal | jammy | noble)
           :
           ;;
         *)
@@ -576,7 +584,7 @@ preconfigurePackages() {
 
   # We set static IP only on Raspberry Pi OS
   if checkStaticIpSupported; then
-    if [[ "${OSCN}" != "bookworm" ]]; then
+    if [[ "${OSCN}" == "bullseye" ]]; then
       BASE_DEPS+=(dhcpcd5)
     else
       useNetworkManager=true
@@ -602,12 +610,12 @@ preconfigurePackages() {
   OPENVPN_SUPPORT=0
   NEED_OPENVPN_REPO=0
 
-  # We require OpenVPN 2.4 or later for ECC support. If not available in the
-  # repositories but we are running x86 Debian or Ubuntu, add the official repo
+  # We require OpenVPN 2.5 or later for ECC support and tls-crypt-v2. If not available
+  # in the repositories but we are running x86 Debian or Ubuntu, add the official repo
   # which provides the updated package.
   if [[ "${PKG_MANAGER}" == 'apt-get' ]]; then
     if [[ -n "${AVAILABLE_OPENVPN}" ]] \
-      && dpkg --compare-versions "${AVAILABLE_OPENVPN}" ge 2.4; then
+      && dpkg --compare-versions "${AVAILABLE_OPENVPN}" ge 2.5; then
       OPENVPN_SUPPORT=1
     else
       if [[ "${PLAT}" == "Debian" ]] \
@@ -625,7 +633,7 @@ preconfigurePackages() {
     fi
   elif [[ "${PKG_MANAGER}" == 'apk' ]]; then
     if [[ -n "${AVAILABLE_OPENVPN}" ]] \
-      && [[ "$(apk version -t "${AVAILABLE_OPENVPN}" 2.4)" == '>' ]]; then
+      && [[ "$(apk version -t "${AVAILABLE_OPENVPN}" 2.5)" == '>' ]]; then
       OPENVPN_SUPPORT=1
     else
       OPENVPN_SUPPORT=0
@@ -649,12 +657,16 @@ preconfigurePackages() {
   # wireguard-dkms does not make the module part of the package since the
   # module itself is built at install time and not part of the .deb).
   # Source: https://github.com/MichaIng/DietPi/blob/7bf5e1041f3b2972d7827c48215069d1c90eee07/dietpi/dietpi-software#L1807-L1815
+  # Additionally, if we're using something like LXC, the host kernel will load
+  # the wireguard module so it'll appear builtin from the container's point of view.
   WIREGUARD_BUILTIN=0
 
   if [[ "${PKG_MANAGER}" == 'apt-get' ]]; then
     if dpkg-query -S '/lib/modules/*/wireguard.ko*' &> /dev/null \
+      || dpkg-query -S '/usr/lib/modules/*/wireguard.ko*' &> /dev/null \
       || modinfo wireguard 2> /dev/null \
-      | grep -q '^filename:[[:blank:]]*(builtin)$'; then
+      | grep -q '^filename:[[:blank:]]*(builtin)$' \
+      || lsmod | grep -q '^wireguard'; then
       WIREGUARD_BUILTIN=1
     fi
   fi
@@ -1014,7 +1026,7 @@ checkStaticIpSupported() {
   # If we are on 'Debian' but the raspi.list file is present,
   # then we actually are on 64-bit Raspberry Pi OS.
   elif [[ "${PLAT}" == "Debian" ]] \
-    && [[ -s /etc/apt/sources.list.d/raspi.list ]]; then
+    && [[ -s /etc/apt/sources.list.d/raspi.list || -s /etc/apt/sources.list.d/raspi.sources ]]; then
     return 0
   else
     return 1
@@ -1087,7 +1099,6 @@ checkipv6uplink() {
     --max-time 3 \
     --connect-timeout 3 \
     --silent \
-    --fail \
     -6 \
     https://google.com \
     > /dev/null
@@ -1706,12 +1717,67 @@ installPiVPN() {
   confNetwork
 
   if [[ "${VPN}" == 'openvpn' ]]; then
-    confLogging
+    if [[ "${PLAT}" == 'Alpine' ]]; then
+      confLogging
+    fi
   elif [[ "${VPN}" == 'wireguard' ]]; then
     writeWireguardTempVarsFile
   fi
 
   writeVPNTempVarsFile
+}
+
+decIPv4ToDot() {
+  local a b c d
+  a=$((($1 & 4278190080) >> 24))
+  b=$((($1 & 16711680) >> 16))
+  c=$((($1 & 65280) >> 8))
+  d=$(($1 & 255))
+  printf "%s.%s.%s.%s\n" $a $b $c $d
+}
+
+dotIPv4ToDec() {
+  local original_ifs=$IFS
+  IFS='.'
+  read -r -a array_ip <<< "$1"
+  IFS=$original_ifs
+  printf "%s\n" $((array_ip[0] * 16777216 + array_ip[1] * 65536 + array_ip[2] * 256 + array_ip[3]))
+}
+
+dotIPv4FirstDec() {
+  local decimal_ip decimal_mask
+  decimal_ip=$(dotIPv4ToDec "$1")
+  decimal_mask=$((2 ** 32 - 1 ^ (2 ** (32 - $2) - 1)))
+  printf "%s\n" "$((decimal_ip & decimal_mask))"
+}
+
+dotIPv4LastDec() {
+  local decimal_ip decimal_mask_inv
+  decimal_ip=$(dotIPv4ToDec "$1")
+  decimal_mask_inv=$((2 ** (32 - $2) - 1))
+  printf "%s\n" "$((decimal_ip | decimal_mask_inv))"
+}
+
+decIPv4ToHex() {
+  local hex
+  hex="$(printf "%08x\n" "$1")"
+  quartet_hi=${hex:0:4}
+  quartet_lo=${hex:4:4}
+  # Removes leading zeros from quartets, purely for aesthetic reasons
+  # Source: https://stackoverflow.com/a/19861690
+  leading_zeros_hi="${quartet_hi%%[!0]*}"
+  leading_zeros_lo="${quartet_lo%%[!0]*}"
+  printf "%s:%s\n" "${quartet_hi#"${leading_zeros_hi}"}" "${quartet_lo#"${leading_zeros_lo}"}"
+}
+
+cidrToMask() {
+  # Source: https://stackoverflow.com/a/20767392
+  set -- $((5 - (${1} / 8))) \
+    255 255 255 255 \
+    $(((255 << (8 - (${1} % 8))) & 255)) \
+    0 0 0
+  shift "${1}"
+  echo "${1-0}.${2-0}.${3-0}.${4-0}"
 }
 
 setVPNDefaultVars() {
@@ -1727,43 +1793,99 @@ setVPNDefaultVars() {
 }
 
 generateRandomSubnet() {
-  local MATCHES
   # Source: https://community.openvpn.net/openvpn/wiki/AvoidRoutingConflicts
-  declare -a SUBNET_EXCLUDE_LIST
+  declare -a excluded_subnets_dec=(
+    167772160 167772415   # 10.0.0.0/24
+    167772416 167772671   # 10.0.1.0/24
+    167837952 167838207   # 10.1.1.0/24
+    167840256 167840511   # 10.1.10.0/24
+    167903232 167903487   # 10.2.0.0/24
+    168296448 168296703   # 10.8.0.0/24
+    168427776 168428031   # 10.10.1.0/24
+    173693440 173693695   # 10.90.90.0/24
+    174326016 174326271   # 10.100.1.0/24
+    184549120 184549375   # 10.255.255.0/24
+    3232235520 3232235775 # 192.168.0.0/24
+    3232235776 3232236031 # 192.168.1.0/24
+  )
 
-  SUBNET_EXCLUDE_LIST=(10.0.0.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.0.1.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.1.1.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.1.10.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.2.0.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.8.0.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.10.1.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.90.90.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.100.1.0/24)
-  SUBNET_EXCLUDE_LIST+=(10.255.255.0/24)
-
-  readarray -t CURRENTLY_USED_SUBNETS <<< "$(ip route show \
+  # Add numeric ranges to the previous array
+  readarray -t currently_used_subnets <<< "$(ip route show \
     | grep -oE '[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\/[0-9]{1,2}')"
-  SUBNET_EXCLUDE_LIST=("${SUBNET_EXCLUDE_LIST[@]}"
-    "${CURRENTLY_USED_SUBNETS[@]}")
 
-  while true; do
-    MATCHES=0
-    pivpnNET="10.$((RANDOM % 256)).$((RANDOM % 256)).0"
+  local used used_ip used_mask
+  for used in "${currently_used_subnets[@]}"; do
+    used_ip="${used%/*}"
+    used_mask="${used##*/}"
 
-    for SUB in "${SUBNET_EXCLUDE_LIST[@]}"; do
-      if grepcidr "${SUB}" <<< "${pivpnNET}/${subnetClass}" \
-        2>&1 > /dev/null; then
-        ((MATCHES++))
+    excluded_subnets_dec+=("$(dotIPv4FirstDec "$used_ip" "$used_mask")")
+    excluded_subnets_dec+=("$(dotIPv4LastDec "$used_ip" "$used_mask")")
+  done
+
+  # Note: excluded_subnets_count array length is twice the number of subnets
+  local excluded_subnets_count="${#excluded_subnets_dec[@]}"
+
+  local source_subnet="$1"
+  local source_ip="${source_subnet%/*}"
+  # shellcheck disable=SC2155
+  local source_ip_dec="$(dotIPv4ToDec "$source_ip")"
+  local source_netmask="${source_subnet##*/}"
+  local source_netmask_dec="$((2 ** 32 - 1 ^ (2 ** (32 - source_netmask) - 1)))"
+
+  local target_netmask="$2"
+
+  local first_ip_target_subnet_dec="$((source_ip_dec & source_netmask_dec))"
+  local total_ips_target_subnet="$((2 ** (32 - target_netmask)))"
+
+  # Picking a random subnet would cause the same subnets to be checked multiple
+  # times shall the number of subnets were small, so instead a random permutation
+  # is scanned to check a subnet only once.
+  local subnets_count="$((2 ** (target_netmask - source_netmask)))"
+  readarray -t random_perm <<< "$(shuf -i 0-"$((subnets_count - 1))")"
+  # random_perm=( 3221 9 8 431 7 [...] )
+
+  # Due to bash performance limitations, it's not pratical to check all subnets.
+  # Taking into account that the install script should not hang for too long even
+  # on a Pi Zero, we avoid doing more than about 5000 iteration.
+  local max_tries="$subnets_count"
+  if [ $((subnets_count * excluded_subnets_count)) -ge 5000 ]; then
+    max_tries="$((5000 / (excluded_subnets_count / 2)))"
+  fi
+
+  local first_ip_subnet_dec last_ip_subnet_dec
+  local first_ip_excluded_subnet_dec last_ip_excluded_subnet_dec
+  local overlap
+  for ((i = 0; i < max_tries; i++)); do
+
+    first_ip_subnet_dec="$((first_ip_target_subnet_dec + total_ips_target_subnet * random_perm[i]))"
+    last_ip_subnet_dec="$((first_ip_subnet_dec + total_ips_target_subnet - 1))"
+
+    overlap=false
+
+    for ((j = 0; j < excluded_subnets_count; j += 2)); do
+
+      first_ip_excluded_subnet_dec="${excluded_subnets_dec[$j]}"
+      last_ip_excluded_subnet_dec="${excluded_subnets_dec[$j + 1]}"
+
+      #                              |-------------subnet2------------|
+      #           |----------subnet1-----------|                      |
+      #           |                  |         |                      |
+      # first_ip_excluded_subnet_dec | last_ip_excluded_subnet_dec    |
+      #                              |                                |
+      #                   first_ip_subnet_dec                last_ip_subnet_dec
+      if ((last_ip_excluded_subnet_dec >= first_ip_subnet_dec)) \
+        && ((first_ip_excluded_subnet_dec <= last_ip_subnet_dec)); then
+        overlap=true
+        break
       fi
+
     done
 
-    if [[ "${MATCHES}" -eq 0 ]]; then
+    if ! "$overlap"; then
+      decIPv4ToDot "$first_ip_subnet_dec"
       break
     fi
   done
-
-  echo "${pivpnNET}"
 }
 
 setOpenVPNDefaultVars() {
@@ -1772,10 +1894,31 @@ setOpenVPNDefaultVars() {
   # Allow custom NET via unattend setupVARs file.
   # Use default if not provided.
   if [[ -z "${pivpnNET}" ]]; then
-    pivpnNET="$(generateRandomSubnet)"
+    echo "::: Generating random subnet in network 10.0.0.0/8..."
+    pivpnNET="$(generateRandomSubnet "10.0.0.0/8" "$subnetClass")"
   fi
 
-  vpnGw="$(cut -d '.' -f 1-3 <<< "${pivpnNET}").1"
+  if [[ -z "${pivpnNET}" ]]; then
+    echo "::: Network 10.0.0.0/8 is unavailable, trying 172.16.0.0/12 next..."
+    pivpnNET="$(generateRandomSubnet "172.16.0.0/12" "$subnetClass")"
+  fi
+
+  if [[ -z "${pivpnNET}" ]]; then
+    echo "::: Network 172.16.0.0/12 is unavailable, trying 192.168.0.0/16 next..."
+    pivpnNET="$(generateRandomSubnet "192.168.0.0/16" "$subnetClass")"
+  fi
+
+  if [[ -z "${pivpnNET}" ]]; then
+    # This should not happen in practice
+    echo "::: Unable to generate a random subnet for PiVPN. Looks like all private networks are in use."
+    exit 1
+  fi
+
+  pivpnNETdec="$(dotIPv4ToDec "${pivpnNET}")"
+
+  vpnGwdec="$((pivpnNETdec + 1))"
+  vpnGw="$(decIPv4ToDot "${vpnGwdec}")"
+  vpnGwhex="$(decIPv4ToHex "${vpnGwdec}")"
 
   if [[ "${pivpnenableipv6}" -eq 1 ]] \
     && [[ -z "${pivpnNETv6}" ]]; then
@@ -1783,7 +1926,7 @@ setOpenVPNDefaultVars() {
   fi
 
   if [[ "${pivpnenableipv6}" -eq 1 ]]; then
-    vpnGwv6="${pivpnNETv6}1"
+    vpnGwv6="${pivpnNETv6}${vpnGwhex}"
   fi
 }
 
@@ -1796,18 +1939,39 @@ setWireguardDefaultVars() {
   # Allow custom NET via unattend setupVARs file.
   # Use default if not provided.
   if [[ -z "${pivpnNET}" ]]; then
-    pivpnNET="$(generateRandomSubnet)"
+    echo "::: Generating random subnet in network 10.0.0.0/8..."
+    pivpnNET="$(generateRandomSubnet "10.0.0.0/8" "$subnetClass")"
   fi
+
+  if [[ -z "${pivpnNET}" ]]; then
+    echo "::: Network 10.0.0.0/8 is unavailable, trying 172.16.0.0/12 next..."
+    pivpnNET="$(generateRandomSubnet "172.16.0.0/12" "$subnetClass")"
+  fi
+
+  if [[ -z "${pivpnNET}" ]]; then
+    echo "::: Network 172.16.0.0/12 is unavailable, trying 192.168.0.0/16 next..."
+    pivpnNET="$(generateRandomSubnet "192.168.0.0/16" "$subnetClass")"
+  fi
+
+  if [[ -z "${pivpnNET}" ]]; then
+    # This should not happen in practice
+    echo "::: Unable to generate a random subnet for PiVPN. Looks like all private networks are in use."
+    exit 1
+  fi
+
+  pivpnNETdec="$(dotIPv4ToDec "${pivpnNET}")"
+
+  vpnGwdec="$((pivpnNETdec + 1))"
+  vpnGw="$(decIPv4ToDot "${vpnGwdec}")"
+  vpnGwhex="$(decIPv4ToHex "${vpnGwdec}")"
 
   if [[ "${pivpnenableipv6}" -eq 1 ]] \
     && [[ -z "${pivpnNETv6}" ]]; then
     pivpnNETv6="fd11:5ee:bad:c0de::"
   fi
 
-  vpnGw="$(cut -d '.' -f 1-3 <<< "${pivpnNET}").1"
-
   if [[ "${pivpnenableipv6}" -eq 1 ]]; then
-    vpnGwv6="${pivpnNETv6}1"
+    vpnGwv6="${pivpnNETv6}${vpnGwhex}"
   fi
 
   # Allow custom allowed IPs via unattend setupVARs file.
@@ -2191,9 +2355,56 @@ the default" "${r}" "${c}" "${DEFAULT_PORT}" \
   echo "pivpnPORT=${pivpnPORT}" >> "${tempsetupVarsFile}"
 }
 
+setupPiholeDNS() {
+  # Add a custom hosts file for VPN clients so they appear
+  # as 'name.pivpn' in the Pi-hole dashboard as well as resolve
+  # by their names.
+  echo "addn-hosts=/etc/pivpn/hosts.${VPN}" \
+    | ${SUDO} tee "${dnsmasqConfig}" > /dev/null
+
+  # Then create an empty hosts file or clear if it exists.
+  ${SUDO} bash -c "> /etc/pivpn/hosts.${VPN}"
+
+  # shellcheck disable=SC1090
+  CORE_VERSION="$(source "$piholeVersions" && echo "${CORE_VERSION}")"
+  if [ "$(echo -e 'v6.0.0\n'"${CORE_VERSION}" | sort -V | head -n 1)" = "v6.0.0" ]; then
+    # Running Pi-hole v6 or later
+    ${SUDO} pihole-FTL --config dns.listeningMode LOCAL
+    ${SUDO} pihole-FTL --config misc.etc_dnsmasq_d true
+  else
+    # Setting Pi-hole to "Listen on all interfaces" allows
+    # dnsmasq to listen on the VPN interface while permitting
+    # queries only from hosts whose address is on the LAN and
+    # VPN subnets.
+    ${SUDO} pihole -a -i local
+  fi
+
+  # Use the Raspberry Pi VPN IP as DNS server.
+  pivpnDNS1="${vpnGw}"
+
+  {
+    echo "pivpnDNS1=${pivpnDNS1}"
+    echo "pivpnDNS2=${pivpnDNS2}"
+  } >> "${tempsetupVarsFile}"
+
+  # Allow incoming DNS requests through UFW.
+  if [[ "${USING_UFW}" -eq 1 ]]; then
+    ${SUDO} ufw insert 1 allow in \
+      on "${pivpnDEV}" to any port 53 \
+      from "${pivpnNET}/${subnetClass}" > /dev/null
+  else
+    ${SUDO} iptables -I INPUT -i "${pivpnDEV}" \
+      -p udp --dport 53 -j ACCEPT -m comment --comment "pihole-DNS-rule"
+  fi
+}
+
 askClientDNS() {
   if [[ "${runUnattended}" == 'true' ]]; then
-    if [[ -z "${pivpnDNS1}" ]] \
+    if [[ "${usePiholeDNS}" == 'true' ]] \
+      && command -v pihole > /dev/null; then
+      setupPiholeDNS
+      return
+    elif [[ -z "${pivpnDNS1}" ]] \
       && [[ -n "${pivpnDNS2}" ]]; then
       pivpnDNS1="${pivpnDNS2}"
       unset pivpnDNS2
@@ -2233,49 +2444,14 @@ askClientDNS() {
 
   # Detect and offer to use Pi-hole
   if command -v pihole > /dev/null; then
-    if whiptail \
-      --backtitle "Setup PiVPN" \
-      --title "Pi-hole" \
-      --yesno "We have detected a Pi-hole installation, \
+    if [[ "${usePiholeDNS}" == 'true' ]] \
+      || whiptail \
+        --backtitle "Setup PiVPN" \
+        --title "Pi-hole" \
+        --yesno "We have detected a Pi-hole installation, \
 do you want to use it as the DNS server for the VPN, so you \
 get ad blocking on the go?" "${r}" "${c}"; then
-      if [[ ! -r "${piholeSetupVars}" ]]; then
-        err "::: Unable to read ${piholeSetupVars}"
-        exit 1
-      fi
-
-      # Add a custom hosts file for VPN clients so they appear
-      # as 'name.pivpn' in the Pi-hole dashboard as well as resolve
-      # by their names.
-      echo "addn-hosts=/etc/pivpn/hosts.${VPN}" \
-        | ${SUDO} tee "${dnsmasqConfig}" > /dev/null
-
-      # Then create an empty hosts file or clear if it exists.
-      ${SUDO} bash -c "> /etc/pivpn/hosts.${VPN}"
-
-      # Setting Pi-hole to "Listen on all interfaces" allows
-      # dnsmasq to listen on the VPN interface while permitting
-      # queries only from hosts whose address is on the LAN and
-      # VPN subnets.
-      ${SUDO} pihole -a -i local
-
-      # Use the Raspberry Pi VPN IP as DNS server.
-      pivpnDNS1="${vpnGw}"
-
-      {
-        echo "pivpnDNS1=${pivpnDNS1}"
-        echo "pivpnDNS2=${pivpnDNS2}"
-      } >> "${tempsetupVarsFile}"
-
-      # Allow incoming DNS requests through UFW.
-      if [[ "${USING_UFW}" -eq 1 ]]; then
-        ${SUDO} ufw insert 1 allow in \
-          on "${pivpnDEV}" to any port 53 \
-          from "${pivpnNET}/${subnetClass}" > /dev/null
-      else
-        ${SUDO} iptables -I INPUT -i "${pivpnDEV}" \
-          -p udp --dport 53 -j ACCEPT -m comment --comment "pihole-DNS-rule"
-      fi
+      setupPiholeDNS
       return
     fi
   fi
@@ -2570,10 +2746,10 @@ Public DNS Name:  ${PUBLICDNS}" "${r}" "${c}"; then
 
 askEncryption() {
   if [[ "${runUnattended}" == 'true' ]]; then
-    if [[ -z "${TWO_POINT_FOUR}" ]] \
-      || [[ "${TWO_POINT_FOUR}" -eq 1 ]]; then
-      TWO_POINT_FOUR=1
-      echo "::: Using OpenVPN 2.4 features"
+    if [[ -z "${TWO_POINT_FIVE}" ]] \
+      || [[ "${TWO_POINT_FIVE}" -eq 1 ]]; then
+      TWO_POINT_FIVE=1
+      echo "::: Using OpenVPN 2.5 features"
 
       if [[ -z "${pivpnENCRYPT}" ]]; then
         pivpnENCRYPT=256
@@ -2588,7 +2764,7 @@ askEncryption() {
         exit 1
       fi
     else
-      TWO_POINT_FOUR=0
+      TWO_POINT_FIVE=0
       echo "::: Using traditional OpenVPN configuration"
 
       if [[ -z "${pivpnENCRYPT}" ]]; then
@@ -2616,7 +2792,7 @@ askEncryption() {
     fi
 
     {
-      echo "TWO_POINT_FOUR=${TWO_POINT_FOUR}"
+      echo "TWO_POINT_FIVE=${TWO_POINT_FIVE}"
       echo "pivpnENCRYPT=${pivpnENCRYPT}"
       echo "USE_PREDEFINED_DH_PARAM=${USE_PREDEFINED_DH_PARAM}"
     } >> "${tempsetupVarsFile}"
@@ -2625,11 +2801,11 @@ askEncryption() {
 
   if [[ "${CUSTOMIZE}" -eq 0 ]]; then
     if [[ "${VPN}" == "openvpn" ]]; then
-      TWO_POINT_FOUR=1
+      TWO_POINT_FIVE=1
       pivpnENCRYPT=256
 
       {
-        echo "TWO_POINT_FOUR=${TWO_POINT_FOUR}"
+        echo "TWO_POINT_FIVE=${TWO_POINT_FIVE}"
         echo "pivpnENCRYPT=${pivpnENCRYPT}"
         echo "USE_PREDEFINED_DH_PARAM=${USE_PREDEFINED_DH_PARAM}"
       } >> "${tempsetupVarsFile}"
@@ -2640,19 +2816,19 @@ askEncryption() {
   if whiptail \
     --backtitle "Setup OpenVPN" \
     --title "Installation mode" \
-    --yesno "OpenVPN 2.4 can take advantage of Elliptic Curves \
+    --yesno "OpenVPN 2.5 can take advantage of Elliptic Curves \
 to provide higher connection speed and improved security over \
 RSA, while keeping smaller certificates.
 
-Moreover, the 'tls-crypt' directive encrypts the certificates \
+Moreover, the 'tls-crypt-v2' directive encrypts the certificates \
 being used while authenticating, increasing privacy.
 
-If your clients do run OpenVPN 2.4 or later you can enable \
+If your clients do run OpenVPN 2.5 or later you can enable \
 these features, otherwise choose 'No' for best \
 compatibility." \
     "${r}" \
     "${c}"; then
-    TWO_POINT_FOUR=1
+    TWO_POINT_FIVE=1
     pivpnENCRYPT="$(whiptail \
       --backtitle "Setup OpenVPN" \
       --title "ECDSA certificate size" \
@@ -2668,7 +2844,7 @@ that 256 bits are already as secure as 3072 bit RSA." "${r}" "${c}" 3 \
       "521" "Use a 521-bit certificate (paranoid level)" OFF \
       3>&1 1>&2 2>&3)"
   else
-    TWO_POINT_FOUR=0
+    TWO_POINT_FIVE=0
     pivpnENCRYPT="$(whiptail \
       --backtitle "Setup OpenVPN" \
       --title "RSA certificate size" \
@@ -2710,20 +2886,10 @@ parameters will be generated on your device." "${r}" "${c}"; then
   fi
 
   {
-    echo "TWO_POINT_FOUR=${TWO_POINT_FOUR}"
+    echo "TWO_POINT_FIVE=${TWO_POINT_FIVE}"
     echo "pivpnENCRYPT=${pivpnENCRYPT}"
     echo "USE_PREDEFINED_DH_PARAM=${USE_PREDEFINED_DH_PARAM}"
   } >> "${tempsetupVarsFile}"
-}
-
-cidrToMask() {
-  # Source: https://stackoverflow.com/a/20767392
-  set -- $((5 - ($1 / 8))) \
-    255 255 255 255 \
-    $(((255 << (8 - ($1 % 8))) & 255)) \
-    0 0 0
-  shift "${1}"
-  echo "${1-0}.${2-0}.${3-0}.${4-0}"
 }
 
 confOpenVPN() {
@@ -2778,11 +2944,13 @@ confOpenVPN() {
 
   cd /etc/openvpn/easy-rsa || exit 1
 
-  if [[ "${TWO_POINT_FOUR}" -eq 1 ]]; then
+  if [[ "${TWO_POINT_FIVE}" -eq 1 ]]; then
     pivpnCERT="ec"
-    pivpnTLSPROT="tls-crypt"
+    pivpnTLSVERS="1.3"
+    pivpnTLSPROT="tls-crypt-v2"
   else
     pivpnCERT="rsa"
+    pivpnTLSVERS="1.2"
     pivpnTLSPROT="tls-auth"
   fi
 
@@ -2857,10 +3025,8 @@ and HMAC key will now be generated." \
   fi
 
   # Build the server
-  EASYRSA_CERT_EXPIRE=3650 ${SUDOE} ./easyrsa \
-    build-server-full \
-    "${SERVER_NAME}" \
-    nopass
+  EASYRSA_CERT_EXPIRE=3650 ${SUDOE} \
+    ./easyrsa --batch build-server-full "${SERVER_NAME}" nopass
 
   if [[ "${pivpnCERT}" == "rsa" ]]; then
     if [[ "${USE_PREDEFINED_DH_PARAM}" -eq 1 ]]; then
@@ -2877,7 +3043,12 @@ and HMAC key will now be generated." \
   fi
 
   # Generate static HMAC key to defend against DDoS
-  ${SUDOE} openvpn --genkey --secret pki/ta.key
+  if [[ "${TWO_POINT_FIVE}" -eq 1 ]]; then
+    ${SUDOE} mkdir -p "/etc/openvpn/easy-rsa/pki/tc-v2"
+    ${SUDOE} openvpn --genkey tls-crypt-v2-server pki/tc-v2/server.key
+  else
+    ${SUDOE} openvpn --genkey tls-auth pki/ta.key
+  fi
 
   # Generate an empty Certificate Revocation List
   ${SUDOE} ./easyrsa gen-crl
@@ -2923,18 +3094,17 @@ and HMAC key will now be generated." \
     "s#\\(dh /etc/openvpn/easy-rsa/pki/dh\\).*#\\1${pivpnENCRYPT}.pem#" \
     /etc/openvpn/server.conf
 
-  if [[ "${pivpnTLSPROT}" == "tls-crypt" ]]; then
-    # If they enabled 2.4 use tls-crypt instead of
-    # tls-auth to encrypt control channel
-    sed_pattern="s/tls-auth"
-    sed_pattern="${sed_pattern} \/etc\/openvpn\/easy-rsa\/pki\/ta.key 0/"
-    sed_pattern="${sed_pattern} tls-crypt"
-    sed_pattern="${sed_pattern} \/etc\/openvpn\/easy-rsa\/pki\/ta.key/"
+  if [[ "${pivpnTLSPROT}" == "tls-crypt-v2" ]]; then
+    # If they enabled 2.5 use tls-crypt-v2 instead of tls-auth to encrypt control channel
+    ta_path="/etc/openvpn/easy-rsa/pki/ta.key"
+    tc_v2_path="/etc/openvpn/easy-rsa/pki/tc-v2/server.key"
+    tc_v2_cmd_path="/opt/pivpn/openvpn/TLSCryptV2Verify.sh"
+    sed_pattern='s|tls-auth '"${ta_path}"' 0|tls-crypt-v2 '"${tc_v2_path}"'\ntls-crypt-v2-verify '"${tc_v2_cmd_path}"'\nscript-security 2|'
     ${SUDO} sed -i "${sed_pattern}" /etc/openvpn/server.conf
   fi
 
   if [[ "${pivpnCERT}" == "ec" ]]; then
-    # If they enabled 2.4 disable dh parameters and specify the
+    # If they enabled 2.5 disable dh parameters and specify the
     # matching curve from the ECDSA certificate
     sed_pattern="s/\(dh \/etc\/openvpn\/easy-rsa\/pki\/dh\).*/dh"
     sed_pattern="${sed_pattern} none\necdh-curve"
@@ -2947,6 +3117,12 @@ and HMAC key will now be generated." \
     ${SUDO} sed -i \
       "s#\\(dh /etc/openvpn/easy-rsa/pki/dh\\).*#\\1${pivpnENCRYPT}.pem#" \
       /etc/openvpn/server.conf
+  fi
+
+  # Increase minimum TLS version to limit ciphersuites reducing attack surface
+  if [[ "${pivpnTLSVERS}" == "1.3" ]]; then
+    ${SUDO} sed -i "s|tls-version-min 1.2|tls-version-min 1.3|" "/etc/openvpn/server.conf"
+    ${SUDO} sed -i "s|tls-version-min 1.2|tls-version-min 1.3|" "${pivpnFilesDir}/files/etc/openvpn/easy-rsa/pki/Default.txt"
   fi
 
   # if they modified VPN network put value in server.conf
@@ -3027,8 +3203,8 @@ confOVPN() {
     "s/SRVRNAME/${SERVER_NAME}/" \
     /etc/openvpn/easy-rsa/pki/Default.txt
 
-  if [[ "${pivpnTLSPROT}" == "tls-crypt" ]]; then
-    # If they enabled 2.4 remove key-direction options since it's not required
+  if [[ "${pivpnTLSPROT}" == "tls-crypt-v2" ]]; then
+    # If they enabled 2.5 remove key-direction options since it's not required
     ${SUDO} sed -i \
       "/key-direction 1/d" \
       /etc/openvpn/easy-rsa/pki/Default.txt
@@ -3058,13 +3234,15 @@ confWireGuard() {
   fi
 
   if [[ -d /etc/wireguard ]]; then
-    # Backup the wireguard folder
-    WIREGUARD_BACKUP="wireguard_$(date +%Y-%m-%d-%H%M%S).tar.gz"
-    echo "::: Backing up the wireguard folder to /etc/${WIREGUARD_BACKUP}"
-    CURRENT_UMASK="$(umask)"
-    umask 0077
-    ${SUDO} tar -czf "/etc/${WIREGUARD_BACKUP}" /etc/wireguard &> /dev/null
-    umask "${CURRENT_UMASK}"
+    if [[ -n "$(${SUDO} ls -A /etc/wireguard)" ]]; then
+      # Backup the wireguard folder
+      WIREGUARD_BACKUP="wireguard_$(date +%Y-%m-%d-%H%M%S).tar.gz"
+      echo "::: Backing up the wireguard folder to /etc/${WIREGUARD_BACKUP}"
+      CURRENT_UMASK="$(umask)"
+      umask 0077
+      ${SUDO} tar -czf "/etc/${WIREGUARD_BACKUP}" /etc/wireguard &> /dev/null
+      umask "${CURRENT_UMASK}"
+    fi
 
     if [[ -f /etc/wireguard/wg0.conf ]]; then
       ${SUDO} rm /etc/wireguard/wg0.conf
@@ -3137,6 +3315,10 @@ confNetwork() {
   fi
 
   ${SUDO} sysctl -p /etc/sysctl.d/99-pivpn.conf > /dev/null
+
+  if [[ "${PLAT}" == 'Alpine' ]]; then
+	${SUDO} rc-update add sysctl
+  fi
 
   if [[ "${USING_UFW}" -eq 1 ]]; then
     echo "::: Detected UFW is enabled."
@@ -3235,7 +3417,7 @@ confNetwork() {
         out on "${IPv4dev}" to any > /dev/null
 
       if [[ "${pivpnenableipv6}" -eq 1 ]]; then
-        ${SUDO} ufw route insert 1 \
+        ${SUDO} ufw route \
           allow in on "${pivpnDEV}" \
           from "${pivpnNETv6}/${subnetClassv6}" \
           out on "${IPv6dev}" to any > /dev/null
@@ -3420,6 +3602,12 @@ confNetwork() {
       ${SUDO} ip6tables-save \
         | ${SUDO} tee /etc/iptables/rules.v6 > /dev/null
       ;;
+	Alpine)
+	  ${SUDO} rc-service iptables save
+	  ${SUDO} rc-service ip6tables save
+	  ${SUDO} rc-update add iptables
+	  ${SUDO} rc-update add ip6tables
+	  ;;
   esac
 
   {
@@ -3436,14 +3624,8 @@ confLogging() {
   # installed at a later time
   ${SUDO} mkdir -p /etc/{rsyslog,logrotate}.d
 
-  if [[ "${PLAT}" == 'Alpine' ]]; then
-    program_name='openvpn'
-  else
-    program_name='ovpn-server'
-  fi
-
-  echo "if \$programname == '${program_name}' then /var/log/openvpn.log
-if \$programname == '${program_name}' then stop" | ${SUDO} tee /etc/rsyslog.d/30-openvpn.conf > /dev/null
+  echo "if \$programname == 'openvpn' then /var/log/openvpn.log
+if \$programname == 'openvpn' then stop" | ${SUDO} tee /etc/rsyslog.d/30-openvpn.conf > /dev/null
 
   echo "/var/log/openvpn.log
 {
@@ -3460,16 +3642,8 @@ if \$programname == '${program_name}' then stop" | ${SUDO} tee /etc/rsyslog.d/30
 }" | ${SUDO} tee /etc/logrotate.d/openvpn > /dev/null
 
   # Restart the logging service
-  case "${PLAT}" in
-    Debian | Raspbian | Ubuntu)
-      ${SUDO} systemctl -q is-active rsyslog.service \
-        && ${SUDO} systemctl restart rsyslog.service
-      ;;
-    Alpine)
-      ${SUDO} rc-service -is rsyslog restart
-      ${SUDO} rc-service -iN rsyslog start
-      ;;
-  esac
+  ${SUDO} rc-service -is rsyslog restart
+  ${SUDO} rc-service -iN rsyslog start
 }
 
 restartServices() {

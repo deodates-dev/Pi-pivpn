@@ -9,10 +9,18 @@ CRT=".crt"
 KEY=".key"
 CA="ca.crt"
 TA="ta.key"
+TC_V2="tc-v2/server.key"
 INDEX="/etc/openvpn/easy-rsa/pki/index.txt"
+TC_V2_METADATA="/etc/pivpn/openvpn/tc-v2-metadata.txt"
 
 # shellcheck disable=SC1090
 source "${setupVars}"
+
+if [ ! -r /opt/pivpn/ipaddr_utils.sh ]; then
+  exit 1
+fi
+# shellcheck disable=SC1091
+source /opt/pivpn/ipaddr_utils.sh
 
 # shellcheck disable=SC2154
 userGroup="${install_user}:${install_user}"
@@ -71,7 +79,7 @@ checkName() {
 keynoPASS() {
   # Build the client key
   export EASYRSA_CERT_EXPIRE="${DAYS}"
-  ./easyrsa build-client-full "${NAME}" nopass
+  ./easyrsa --batch build-client-full "${NAME}" nopass
   cd pki || exit
 }
 
@@ -155,21 +163,11 @@ keyPASS() {
   fi
 
   export EASYRSA_CERT_EXPIRE="${DAYS}"
-  ./easyrsa --passin=pass:"${PASSWD}" \
+  ./easyrsa --batch --passin=pass:"${PASSWD}" \
     --passout=pass:"${PASSWD}" \
     build-client-full "${NAME}"
 
   cd pki || exit
-}
-
-cidrToMask() {
-  # Source: https://stackoverflow.com/a/20767392
-  set -- $((5 - (${1} / 8))) \
-    255 255 255 255 \
-    $(((255 << (8 - (${1} % 8))) & 255)) \
-    0 0 0
-  shift "${1}"
-  echo "${1-0}.${2-0}.${3-0}.${4-0}"
 }
 
 ### Script
@@ -233,7 +231,7 @@ while [[ "$#" -gt 0 ]]; do
       DAYS="${_val}"
       ;;
     -i | --iOS)
-      if [[ "${TWO_POINT_FOUR}" -ne 1 ]]; then
+      if [[ "${TWO_POINT_FIVE}" -ne 1 ]]; then
         iOS=1
       else
         err "Sorry, can't generate iOS-specific configs for ECDSA certificates"
@@ -292,6 +290,35 @@ if [[ ! -d "${install_home}/ovpns" ]]; then
   chown "${userGroup}" "${install_home}/ovpns"
   chmod 0750 "${install_home}/ovpns"
 fi
+
+# Exclude first, last and server addresses
+# shellcheck disable=SC2154
+MAX_CLIENTS="$((2 ** (32 - subnetClass) - 3))"
+
+# shellcheck disable=SC2154
+FIRST_IPV4_DEC="$(dotIPv4FirstDec "${pivpnNET}" "${subnetClass}")"
+LAST_IPV4_DEC="$(dotIPv4LastDec "${pivpnNET}" "${subnetClass}")"
+
+if [ "$(find /etc/openvpn/ccd -type f | wc -l)" -ge "${MAX_CLIENTS}" ]; then
+  echo "::: Can't add any more clients (max. ${MAX_CLIENTS})!"
+  exit 1
+fi
+
+# Find an unused address for the client IP
+for ((ip = FIRST_IPV4_DEC + 2; ip <= LAST_IPV4_DEC - 1; ip++)); do
+  # find returns 0 if the folder is empty, so we create the 'ls -A [...]'
+  # exception to stop at the first static IP (10.8.0.2). Otherwise it would
+  # cycle to the end without finding and available octet.
+  # disabling SC2514, variable sourced externaly
+  ip_dot="$(decIPv4ToDot "${ip}")"
+
+  if [[ -z "$(ls -A /etc/openvpn/ccd)" ]] \
+    || ! find /etc/openvpn/ccd -type f \
+      -exec grep -q "${ip_dot}" {} +; then
+    UNUSED_IPV4_DOT="${ip_dot}"
+    break
+  fi
+done
 
 #bitWarden
 if [[ "${BITWARDEN}" =~ "2" ]]; then
@@ -392,13 +419,32 @@ fi
 
 echo "CA public Key found: ${CA}"
 
-#Confirm the tls key file exists
-if [[ ! -f "${TA}" ]]; then
-  err "[ERROR]: tls Private Key not found: ${TA}"
-  exit
-fi
+if [[ "${TWO_POINT_FIVE}" -eq 1 ]]; then
+  # Confirm the tls-crypt-v2 key file exists
+  if [[ ! -f "${TC_V2}" ]]; then
+    err "[ERROR]: TLS crypt server key not found: ${TC_V2}"
+    exit
+  fi
 
-echo "tls Private Key found: ${TA}"
+  echo "TLS crypt server key found: ${TC_V2}"
+
+  # Generate and save a random 128-bit ID to embed into the tls-crypt key
+  # to reject revoked clients at the tls-crypt level
+  metadata="$(LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 22)"
+  base64_metadata="$(echo -n "${metadata}" | base64 -w 0)"
+  echo "${NAME} ${metadata}" >> "${TC_V2_METADATA}"
+
+  # Generate client-specific tls-crypt-v2 key based on the server one
+  openvpn --tls-crypt-v2 "${TC_V2}" --genkey tls-crypt-v2-client "tc-v2/${NAME}.key" "${base64_metadata}"
+else
+  # Confirm the tls-auth key file exists
+  if [[ ! -f "${TA}" ]]; then
+    err "[ERROR]: TLS auth key not found: ${TA}"
+    exit
+  fi
+
+  echo "TLS auth key found: ${TA}"
+fi
 
 ## Added new step to create an .ovpn12 file that can be stored on iOS keychain
 ## This step is more secure method and does not require the end-user to keep
@@ -431,10 +477,10 @@ echo "tls Private Key found: ${TA}"
   fi
 
   # Finally, append the tls Private Key
-  if [[ "${iOS}" != 1 ]] && [[ "${TWO_POINT_FOUR}" -eq 1 ]]; then
-    echo "<tls-crypt>"
-    cat "${TA}"
-    echo "</tls-crypt>"
+  if [[ "${iOS}" != 1 ]] && [[ "${TWO_POINT_FIVE}" -eq 1 ]]; then
+    echo "<tls-crypt-v2>"
+    cat "tc-v2/${NAME}.key"
+    echo "</tls-crypt-v2>"
   else
     echo "<tls-auth>"
     cat "${TA}"
@@ -469,33 +515,15 @@ if [[ "${iOS}" == 1 ]]; then
   printf "========================================================\n\n"
 fi
 
-#disabling SC2514, variable sourced externaly
-# shellcheck disable=SC2154
-NET_REDUCED="${pivpnNET::-2}"
-
-# Find an unused number for the last octet of the client IP
-for i in {2..254}; do
-  # find returns 0 if the folder is empty, so we create the 'ls -A [...]'
-  # exception to stop at the first static IP (10.8.0.2). Otherwise it would
-  # cycle to the end without finding and available octet.
-  # disabling SC2514, variable sourced externaly
-  # shellcheck disable=SC2154
-  if [[ -z "$(ls -A /etc/openvpn/ccd)" ]] \
-    || ! find /etc/openvpn/ccd -type f \
-      -exec grep -q "${NET_REDUCED}.${i}" {} +; then
-    COUNT="${i}"
-    echo -n "ifconfig-push ${NET_REDUCED}.${i} " >> /etc/openvpn/ccd/"${NAME}"
-    # The space after ${i} is important ------^!
-    cidrToMask "${subnetClass}" >> /etc/openvpn/ccd/"${NAME}"
-    # the end resuld should be a line like:
-    # ifconfig-push ${NET_REDUCED}.${i} ${subnetClass}
-    # ifconfig-push 10.205.45.8 255.255.255.0
-    break
-  fi
-done
+echo -n "ifconfig-push ${UNUSED_IPV4_DOT} " >> /etc/openvpn/ccd/"${NAME}"
+# The space after ${UNUSED_IPV4_DOT} is important!
+cidrToMask "${subnetClass}" >> /etc/openvpn/ccd/"${NAME}"
+# the end resuld should be a line like:
+# ifconfig-push ${UNUSED_IPV4_DOT} ${subnetClass}
+# ifconfig-push 10.205.45.8 255.255.255.0
 
 if [[ -f /etc/pivpn/hosts.openvpn ]]; then
-  echo "${NET_REDUCED}.${COUNT} ${NAME}.pivpn" >> /etc/pivpn/hosts.openvpn
+  echo "${UNUSED_IPV4_DOT} ${NAME}.pivpn" >> /etc/pivpn/hosts.openvpn
 
   if killall -SIGHUP pihole-FTL; then
     echo "::: Updated hosts file for Pi-hole"

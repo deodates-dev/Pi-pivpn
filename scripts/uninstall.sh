@@ -16,6 +16,7 @@ c=$((c < 70 ? 70 : c))
 
 PKG_MANAGER="apt-get"
 PKG_REMOVE="${PKG_MANAGER} -y remove --purge"
+piholeVersions="/etc/pihole/versions"
 dnsmasqConfig="/etc/dnsmasq.d/02-pivpn.conf"
 setupVarsFile="setupVars.conf"
 setupConfigDir="/etc/pivpn"
@@ -150,7 +151,7 @@ removeAll() {
 
   # Disable IPv4 forwarding
   if [[ "${vpnStillExists}" -eq 0 ]]; then
-    sed -i '/net.ipv4.ip_forward=1/c\#net.ipv4.ip_forward=1' /etc/sysctl.conf
+    rm -f /etc/sysctl.d/99-pivpn.conf
     sysctl -p
   fi
 
@@ -250,7 +251,14 @@ removeAll() {
 
   if [[ -f "${dnsmasqConfig}" ]]; then
     rm -f "${dnsmasqConfig}"
-    pihole restartdns
+    # shellcheck disable=SC1090
+    CORE_VERSION="$(source "$piholeVersions" && echo "${CORE_VERSION}")"
+    if [ "$(echo -e 'v6.0.0\n'"${CORE_VERSION}" | sort -V | head -n 1)" = "v6.0.0" ]; then
+      # Running Pi-hole v6 or later
+      pihole reloaddns
+    else
+      pihole restartdns reload
+    fi
   fi
 
   echo ":::"
